@@ -6,8 +6,11 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.api.ingestion import router as ingestion_router
+from app.api.search import router as search_router
+from app.api.sessions import router as sessions_router
 from app.core.config import settings
 from app.core.database import close_pg_pool, get_pg_pool, init_pg_pool
 from app.core.logging import setup_logging
@@ -96,6 +99,9 @@ def create_app() -> FastAPI:
     # Routers
     application.include_router(health_router)
     application.include_router(ingestion_router, prefix="/api/v1")
+    application.include_router(chat_router, prefix="/api/v1")
+    application.include_router(search_router, prefix="/api/v1")
+    application.include_router(sessions_router, prefix="/api/v1")
 
     return application
 

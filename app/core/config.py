@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # Relevance
     relevance_threshold: float = 0.4
 
+    # Session
+    session_ttl_hours: int = 24
+
     # Embedding Cache
     embedding_cache_ttl: int = 86400  # 24 hours in seconds
 
