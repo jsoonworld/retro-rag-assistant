@@ -9,10 +9,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.health import router as health_router
 from app.api.ingestion import router as ingestion_router
 from app.core.config import settings
-from app.core.database import close_pg_pool, init_pg_pool
+from app.core.database import close_pg_pool, get_pg_pool, init_pg_pool
 from app.core.logging import setup_logging
 from app.core.mysql import close_mysql_pool, init_mysql_pool
-from app.core.redis import close_redis, init_redis
+from app.core.openai_client import OpenAIClient
+from app.core.redis import close_redis, get_redis, init_redis
+from app.graph.builder import compile_graph
+from app.search.cache import EmbeddingCache
+from app.search.hybrid import HybridSearcher
+from app.search.keyword import KeywordSearcher
+from app.search.vector import VectorSearcher
 
 logger = structlog.get_logger()
 
@@ -26,6 +32,17 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     await init_pg_pool()
     await init_mysql_pool()
     await init_redis()
+
+    # Compile LangGraph RAG pipeline
+    pg_pool = get_pg_pool()
+    redis_client = get_redis()
+    openai_client = OpenAIClient()
+    vector_searcher = VectorSearcher(pg_pool)
+    keyword_searcher = KeywordSearcher(pg_pool)
+    hybrid_searcher = HybridSearcher(vector_searcher, keyword_searcher)
+    embedding_cache = EmbeddingCache(redis_client)
+    _app.state.graph = compile_graph(openai_client, hybrid_searcher, embedding_cache)
+    _app.state.openai_client = openai_client
 
     logger.info("app_started")
     yield

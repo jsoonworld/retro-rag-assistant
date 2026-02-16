@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o"
     llm_fallback_model: str = "gpt-4o-mini"
 
+    # Hybrid Search
+    hybrid_search_alpha: float = 0.7
+
+    # Relevance
+    relevance_threshold: float = 0.4
+
+    # Embedding Cache
+    embedding_cache_ttl: int = 86400  # 24 hours in seconds
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",")]
