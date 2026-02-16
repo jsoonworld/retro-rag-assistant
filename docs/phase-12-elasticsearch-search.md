@@ -1,608 +1,290 @@
-# Phase 12: Elasticsearch 검색 + CDC 파이프라인
+# AI Retrospect Assistant — RAG + LangGraph
 
 ## 한 줄 요약
 
-MySQL의 LIKE 검색을 **Elasticsearch + Nori 한국어 형태소 분석기**로 대체하고, **Debezium CDC**로 실시간 동기화 파이프라인을 구축한다.
+OpenAI Embedding + pgvector + LangGraph를 활용한 **AI 회고 어시스턴트**. 과거 회고 데이터를 벡터화하여, "우리 팀의 반복되는 문제가 뭐야?" 같은 질문에 근거 기반 답변을 제공한다.
 
 ---
 
-## 현재 상태 (AS-IS)
+## 풀고자 하는 문제
+
+현재 moalog-server의 AI 기능:
 
 ```
-Client → GET /api/v1/retrospects/search?keyword=회고
-              │
-              └─ moalog-server
-                    │
-                    └─ MySQL: SELECT * FROM retrospects
-                              WHERE title LIKE '%회고%'
-                              ORDER BY start_time DESC
+현재: 단일 회고 → OpenAI → 그 회고에 대한 분석 (단건)
+     "이번 스프린트 회고를 분석해줘"
+
+없는 것: 여러 회고를 종합한 패턴 분석, 맥락 기반 Q&A
+     "최근 6개월간 반복되는 이슈가 뭐야?"        ← 불가능
+     "프론트엔드 팀의 개선 트렌드를 보여줘"        ← 불가능
+     "지난번 비슷한 문제 때 어떻게 해결했지?"      ← 불가능
 ```
 
-**문제점**:
-1. **LIKE '%keyword%'** — 인덱스 사용 불가, 풀스캔
-2. **형태소 분석 없음** — "회고했다"로 검색하면 "회고" 결과 못 찾음
-3. **검색 범위** — title만 검색 (응답 내용, 댓글 검색 불가)
-4. **검색 기능 부족** — 자동완성, 하이라이팅, 유사어 없음
+**핵심 한계**: 단건 분석만 가능. 과거 회고를 **검색하고 종합하는 능력**이 없음.
 
 ---
 
-## 목표 상태 (TO-BE)
+## 아키텍처
 
 ```
-                     ┌──────────────────────────────────────┐
-                     │         Elasticsearch 8.x             │
-                     │                                      │
-  검색 요청 ────────▶│  Index: moalog-retrospects            │
-                     │  ├─ title (Nori 분석)                 │
-                     │  ├─ responses[].content (Nori 분석)   │
-                     │  ├─ comments[].text (Nori 분석)       │
-                     │  ├─ method (keyword)                  │
-                     │  ├─ room_id (keyword)                 │
-                     │  ├─ created_at (date)                 │
-                     │  └─ member_ids[] (keyword)            │
-                     └──────────────▲───────────────────────┘
-                                    │
-                                    │ 실시간 동기화
-                                    │
-                     ┌──────────────┴───────────────────────┐
-                     │         Debezium (CDC)                │
-                     │                                      │
-                     │  MySQL binlog → Kafka → ES Sink      │
-                     │                                      │
-                     │  ┌─────────┐  ┌──────┐  ┌────────┐  │
-                     │  │Debezium │─▶│Kafka │─▶│ES Sink │  │
-                     │  │Connector│  │      │  │Connect.│  │
-                     │  └─────────┘  └──────┘  └────────┘  │
-                     └──────────────────────────────────────┘
-                                    ▲
-                                    │ binlog
-                     ┌──────────────┴───────────────────────┐
-                     │          MySQL 8.0                    │
-                     │  retrospects, response, ...           │
-                     └──────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│               AI Retrospect Assistant                             │
+│               Python · FastAPI · LangGraph                       │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ Ingestion Pipeline                                     │      │
+│  │                                                        │      │
+│  │ moalog MySQL → Sync Job → Chunking → OpenAI Embedding │      │
+│  │                (주기적)   (회고 단위)  (1536차원)       │      │
+│  │                               │                        │      │
+│  │                               ▼                        │      │
+│  │                        ┌──────────────┐                │      │
+│  │                        │   pgvector   │                │      │
+│  │                        │ (PostgreSQL)  │                │      │
+│  │                        └──────────────┘                │      │
+│  └────────────────────────────────────────────────────────┘      │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ LangGraph Workflow                                     │      │
+│  │                                                        │      │
+│  │ User Query                                             │      │
+│  │   ▼                                                    │      │
+│  │ ┌─────────────┐   ┌───────────┐   ┌─────────────┐     │      │
+│  │ │Query Analyzer│──▶│ Retriever │──▶│Context Build│     │      │
+│  │ │의도 분류     │   │pgvector   │   │토큰 최적화  │     │      │
+│  │ │필터 추출     │   │하이브리드 │   │             │     │      │
+│  │ └─────────────┘   └───────────┘   └──────┬──────┘     │      │
+│  │                                          ▼            │      │
+│  │                                   ┌─────────────┐     │      │
+│  │                                   │ GPT-4o      │     │      │
+│  │                                   │ 답변 생성   │     │      │
+│  │                                   │ + 출처 인용 │     │      │
+│  │                                   │ (SSE 스트림) │     │      │
+│  │                                   └─────────────┘     │      │
+│  └────────────────────────────────────────────────────────┘      │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ Conversation Memory (Redis)                             │      │
+│  │ 세션별 대화 이력 (최근 10턴, TTL 1시간)                  │      │
+│  │ → 후속 질문 "그중에서 가장 심각한 건?" 지원              │      │
+│  └────────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 선택지: 동기화 방식
+## 기술 스택
 
-### Option A: Debezium CDC (선택)
-
-```
-MySQL binlog → Debezium → Kafka → Elasticsearch Sink Connector
-```
-
-| 장점 | 단점 |
-|------|------|
-| DB 변경 자동 감지 (binlog) | Debezium + Kafka Connect 인프라 추가 |
-| 애플리케이션 코드 수정 없음 | 초기 설정 복잡 |
-| 삭제/수정도 자동 반영 | Kafka 의존성 (이미 있음) |
-| 스키마 변경 자동 추적 | 디버깅 어려움 |
-
-### Option B: Application-Level Sync
-
-```
-moalog-server → (CRUD 이후) → HTTP로 ES에 직접 색인
-```
-
-| 장점 | 단점 |
-|------|------|
-| 단순, 인프라 추가 없음 | 모든 쓰기 코드에 ES 호출 추가 |
-| 디버깅 쉬움 | DB 커밋 ↔ ES 색인 불일치 가능 |
-| Rust에서 직접 제어 | 삭제/벌크 수정 누락 위험 |
-
-### Option C: Dual Write (DB + ES 동시 쓰기)
-
-| 장점 | 단점 |
-|------|------|
-| 실시간 반영 | **분산 트랜잭션 문제** (DB OK + ES FAIL) |
-| 코드 제어 가능 | 데이터 불일치 위험 높음 |
-
-> **판단**: Kafka가 이미 있으므로 Debezium CDC가 가장 자연스러움. Application-Level은 Rust 코드 곳곳에 ES 호출을 심어야 하므로 침투적. Dual Write는 일관성 문제로 제외. CDC는 면접에서도 데이터 파이프라인 이해도를 보여주는 강력한 포인트.
+| 카테고리 | 기술 | 선택 이유 |
+|---------|------|----------|
+| 언어 | Python 3.12 | LangGraph/LangChain 생태계가 Python 중심 |
+| 웹 프레임워크 | FastAPI | async 네이티브, SSE 지원, OpenAPI 자동 생성 |
+| AI 워크플로우 | LangGraph | 조건부 분기, 멀티스텝 추론, 상태 관리 |
+| LLM | OpenAI GPT-4o | 한국어 품질 최상위 |
+| Embedding | text-embedding-3-small | 1536차원, 비용 효율적 |
+| Vector DB | pgvector (PostgreSQL 확장) | 기존 PostgreSQL 활용, 별도 인프라 불필요 |
+| 대화 메모리 | Redis | TTL 기반 세션 관리 |
+| 모니터링 | prometheus_client | 토큰 사용량, 응답 시간 |
 
 ---
 
-## 구현 범위 (4개 기능)
+## 핵심 기능 (5개)
 
-### 기능 1: Elasticsearch 클러스터 + Nori 분석기
+### 1. Ingestion — 회고 데이터 벡터화
 
-**인덱스 매핑**:
+**청킹 전략** (회고 1건 → N개 청크):
 
-```json
-{
-  "settings": {
-    "analysis": {
-      "analyzer": {
-        "korean": {
-          "type": "custom",
-          "tokenizer": "nori_tokenizer",
-          "filter": ["nori_readingform", "lowercase", "nori_part_of_speech"]
-        },
-        "korean_autocomplete": {
-          "type": "custom",
-          "tokenizer": "nori_tokenizer",
-          "filter": ["nori_readingform", "lowercase", "edge_ngram_filter"]
-        }
-      },
-      "filter": {
-        "edge_ngram_filter": {
-          "type": "edge_ngram",
-          "min_gram": 1,
-          "max_gram": 10
-        },
-        "nori_part_of_speech": {
-          "type": "nori_part_of_speech",
-          "stoptags": ["E", "J", "SC", "SE", "SF", "SP", "SSC", "SSO", "VCN", "VCP", "VSV", "XPN", "XSA", "XSN", "XSV"]
-        }
-      }
-    },
-    "number_of_shards": 1,
-    "number_of_replicas": 0
-  },
-  "mappings": {
-    "properties": {
-      "retrospect_id":   { "type": "long" },
-      "title":           { "type": "text", "analyzer": "korean", "fields": {
-                            "autocomplete": { "type": "text", "analyzer": "korean_autocomplete" },
-                            "keyword": { "type": "keyword" }
-                          }},
-      "method":          { "type": "keyword" },
-      "room_id":         { "type": "long" },
-      "room_name":       { "type": "keyword" },
-      "start_time":      { "type": "date" },
-      "member_ids":      { "type": "long" },
-      "responses": {
-        "type": "nested",
-        "properties": {
-          "response_id":   { "type": "long" },
-          "content":       { "type": "text", "analyzer": "korean" },
-          "category":      { "type": "keyword" },
-          "member_id":     { "type": "long" }
-        }
-      },
-      "comments": {
-        "type": "nested",
-        "properties": {
-          "comment_id":    { "type": "long" },
-          "text":          { "type": "text", "analyzer": "korean" },
-          "member_id":     { "type": "long" }
-        }
-      },
-      "response_count":  { "type": "integer" },
-      "comment_count":   { "type": "integer" },
-      "like_count":      { "type": "integer" },
-      "updated_at":      { "type": "date" }
-    }
-  }
-}
-```
+| 청크 타입 | 내용 | 예시 |
+|----------|------|------|
+| summary | 제목 + 방법 + 날짜 + 참가자 수 | "[백엔드팀] Sprint 3 회고 (2026-01-15) KPT 5명" |
+| response | 카테고리별 응답 묶음 | "[Problem] - 코드 리뷰 지연 - 배포 병목" |
+| analysis | AI 분석 결과 (있으면) | "[AI 분석] 주요 이슈는..." |
 
-**Nori 분석기 효과**:
+**임베딩**: OpenAI `text-embedding-3-small` (1536차원, 배치 처리)
 
-| 입력 | LIKE 검색 | Nori 검색 |
-|------|----------|----------|
-| "회고했다" → "회고" 검색 | ✗ (불일치) | ✓ (형태소: 회고+했다) |
-| "팀 프로젝트" → "프로젝트" | ✓ | ✓ |
-| "개선점을" → "개선점" | ✗ | ✓ (형태소: 개선점+을) |
-| "retrospect" → "Retrospect" | ✗ (대소문자) | ✓ (lowercase) |
+**동기화**: 주기적 폴링 (5분) — 새로 생성/수정된 회고만 증분 처리
 
-**트레이드오프: Nori vs Mecab**
+**트레이드오프: pgvector vs Pinecone/Weaviate**
 
-| | Nori (선택) | Mecab (은전한닢) |
+| | pgvector (선택) | Pinecone / Weaviate |
 |---|---|---|
-| 설치 | ES 플러그인 (기본 내장 8.x) | 사전 파일 별도 설치 |
-| 사전 | 기본 사전 (충분) | 커스텀 사전 지원 강력 |
-| 정확도 | 실용적 수준 | 약간 더 정확 |
-| 유지보수 | ES 업그레이드 시 자동 | 사전 수동 관리 |
+| 인프라 | 기존 PostgreSQL에 확장 | 별도 서비스 |
+| 비용 | 0 (self-hosted) | SaaS 비용 |
+| 성능 | ~100K 벡터 OK | 수백만 벡터 |
+| SQL 결합 | WHERE + 벡터 검색 하나의 쿼리 | 별도 API |
 
-> **판단**: ES 8.x에 Nori 기본 내장. 회고 서비스의 도메인 특화 용어가 많지 않으므로 기본 사전으로 충분. Mecab은 쇼핑/의료 등 특수 도메인에서 유리.
+> **판단**: 회고 데이터는 수천~수만 건. pgvector HNSW 인덱스로 충분. SQL 필터링(날짜, 방, 방법)과 벡터 검색을 결합할 수 있는 것이 강점.
 
 ---
 
-### 기능 2: Debezium CDC 파이프라인
+### 2. LangGraph 워크플로우 — 의도별 분기
 
-**아키텍처**:
+```python
+workflow = StateGraph(AssistantState)
 
-```
-MySQL (binlog)
-    │
-    ▼
-Debezium Source Connector (Kafka Connect)
-    │ 변경 이벤트 발행
-    ▼
-Kafka Topics:
-    ├─ dbserver1.retrospect.retrospects
-    ├─ dbserver1.retrospect.response
-    ├─ dbserver1.retrospect.response_comment
-    └─ dbserver1.retrospect.retro_room
-    │
-    ▼
-Elasticsearch Sink Connector (Kafka Connect)
-    │ 문서 색인/업데이트/삭제
-    ▼
-Elasticsearch Index: moalog-retrospects
+workflow.add_node("analyze_query", analyze_query)
+workflow.add_node("retrieve", retrieve_from_pgvector)
+workflow.add_node("build_context", build_context)
+workflow.add_node("generate_answer", generate_with_gpt4o)
+workflow.add_node("format_response", format_response)
+
+# 의도별 분기
+workflow.add_conditional_edges("analyze_query", route_by_intent, {
+    "pattern_analysis": "retrieve",  # "반복되는 문제" → 넓은 검색
+    "search": "retrieve",           # "Redis 관련 회고" → 타겟 검색
+    "compare": "retrieve",          # "1월 vs 2월 비교" → 다중 검색
+    "general": "generate_answer",   # "KPT가 뭐야?" → 바로 답변
+})
 ```
 
-**Debezium Source Connector 설정**:
+| 의도 | 예시 | 검색 전략 | 생성 전략 |
+|------|------|----------|----------|
+| pattern_analysis | "반복되는 문제?" | 최근 N개월 전체, Problem 가중 | 패턴 추출 + 빈도 |
+| search | "Redis 관련 회고" | 키워드+벡터 하이브리드 | 목록 + 요약 |
+| compare | "1월 vs 2월 비교" | 기간별 분리 검색 | 차이점 비교 |
+| general | "KPT가 뭐야?" | 검색 불필요 | LLM 지식 |
 
-```json
-{
-  "name": "moalog-mysql-source",
-  "config": {
-    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
-    "database.hostname": "mysql",
-    "database.port": "3306",
-    "database.user": "debezium",
-    "database.password": "${DEBEZIUM_DB_PASSWORD}",
-    "database.server.id": "1001",
-    "topic.prefix": "dbserver1",
-    "database.include.list": "retrospect",
-    "table.include.list": "retrospect.retrospects,retrospect.response,retrospect.response_comment,retrospect.retro_room",
-    "schema.history.internal.kafka.bootstrap.servers": "fluxpay-kafka:9092",
-    "schema.history.internal.kafka.topic": "schema-changes.retrospect",
-    "include.schema.changes": "false",
-    "transforms": "unwrap",
-    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-    "transforms.unwrap.drop.tombstones": "false",
-    "transforms.unwrap.delete.handling.mode": "rewrite"
-  }
-}
+**트레이드오프: LangGraph vs 단순 체이닝** — 의도별 다른 처리가 필요하므로 LangGraph의 조건부 분기가 적합. 단순 RAG라면 체이닝으로 충분.
+
+---
+
+### 3. 하이브리드 검색 — Vector + Keyword
+
+```python
+async def hybrid_search(query, filters, top_k=10):
+    # 1. 벡터 검색 (의미적 유사도)
+    vector_results = await pgvector_search(query_embedding, filters, top_k)
+
+    # 2. 키워드 검색 (PostgreSQL ts_vector)
+    keyword_results = await keyword_search(query, filters, top_k)
+
+    # 3. RRF (Reciprocal Rank Fusion)로 결합
+    return reciprocal_rank_fusion(vector_results, keyword_results)
 ```
 
-**MySQL 사전 준비**:
+> 벡터만 → "Redis"를 "캐시"로도 찾음 but 키워드 매칭 약함. 키워드만 → 유사어 못 찾음. RRF로 양쪽 장점 결합.
+
+---
+
+### 4. 스트리밍 응답 (SSE)
+
+```python
+@app.post("/api/v1/assistant/chat")
+async def chat(request: ChatRequest):
+    return StreamingResponse(stream_answer(request), media_type="text/event-stream")
+
+# SSE 이벤트:
+# data: {"type": "text", "content": "최근 6개월간"}
+# data: {"type": "text", "content": " 회고를 분석한 결과..."}
+# data: {"type": "citations", "data": [{retrospect_id, title, date, relevance}]}
+# data: {"type": "done"}
+```
+
+---
+
+### 5. 대화 메모리 (Redis)
+
+```python
+# Redis List: session:{session_id}:history (TTL 1시간)
+# 최근 10턴(20개 메시지) 유지
+
+# 멀티턴 예시:
+# User:  "반복되는 문제점이 뭐야?"
+# AI:    "1. 코드 리뷰 지연 (5회) 2. 배포 병목 (4회)..."
+# User:  "코드 리뷰 문제를 어떻게 해결했어?"   ← 후속 질문
+# AI:    "코드 리뷰에 대해 팀이 시도한 해결책: PR 크기 제한, 리뷰어 자동 배정..."
+```
+
+---
+
+## DB 스키마
+
 ```sql
--- Debezium 전용 유저 (binlog 읽기 권한)
-CREATE USER 'debezium'@'%' IDENTIFIED BY 'debezium_password';
-GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';
+CREATE EXTENSION IF NOT EXISTS vector;
 
--- binlog 활성화 확인 (Docker MySQL 8.0은 기본 활성)
-SHOW VARIABLES LIKE 'log_bin';          -- ON
-SHOW VARIABLES LIKE 'binlog_format';    -- ROW (필수)
+CREATE TABLE retrospect_embeddings (
+    id              BIGSERIAL PRIMARY KEY,
+    retrospect_id   BIGINT NOT NULL,
+    chunk_type      VARCHAR(20) NOT NULL,
+    category        VARCHAR(50),
+    content         TEXT NOT NULL,
+    embedding       vector(1536) NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE (retrospect_id, chunk_type, category)
+);
+
+CREATE INDEX idx_embedding_hnsw ON retrospect_embeddings
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 ```
 
-**Elasticsearch Sink Connector 설정**:
+---
 
+## API 설계
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/v1/assistant/chat` | 질의응답 (SSE 스트리밍) |
+| GET | `/api/v1/assistant/sessions/{id}/history` | 대화 이력 |
+| DELETE | `/api/v1/assistant/sessions/{id}` | 세션 삭제 |
+| POST | `/api/v1/assistant/search` | 벡터 검색만 (RAG 없이) |
+| POST | `/api/v1/ingestion/sync` | 수동 동기화 트리거 |
+| GET | `/api/v1/ingestion/status` | 동기화 상태 |
+
+**Chat 요청**:
 ```json
 {
-  "name": "moalog-es-sink",
-  "config": {
-    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
-    "connection.url": "http://elasticsearch:9200",
-    "topics": "dbserver1.retrospect.retrospects",
-    "type.name": "_doc",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
-    "value.converter.schemas.enable": "false",
-    "transforms": "extractKey",
-    "transforms.extractKey.type": "org.apache.kafka.connect.transforms.ExtractField$Key",
-    "transforms.extractKey.field": "retrospect_id",
-    "key.ignore": "false",
-    "schema.ignore": "true",
-    "behavior.on.null.values": "DELETE",
-    "write.method": "UPSERT"
-  }
+  "session_id": "sess-abc123",
+  "message": "우리 팀의 반복되는 문제점이 뭐야?",
+  "filters": { "room_ids": [1, 2], "date_from": "2025-07-01" }
 }
 ```
-
-**변경 파일**:
-- `moalog-server/monitoring/debezium/` (신규 디렉토리)
-  - `mysql-source.json` — Debezium Source 커넥터 설정
-  - `es-sink.json` — Elasticsearch Sink 커넥터 설정
-  - `register-connectors.sh` — 커넥터 등록 스크립트
-
-**트레이드오프: Debezium 위치**
-
-| | Kafka Connect (선택) | 독립 Debezium Server |
-|---|---|---|
-| 의존성 | Kafka Connect 클러스터 필요 | 단독 실행 가능 |
-| Sink 지원 | Sink Connector로 ES 직접 연결 | 별도 Consumer 필요 |
-| 운영 | Kafka Connect REST API로 관리 | 간단하지만 Sink 없음 |
-| 확장성 | Connector 추가로 확장 | 제한적 |
-
-> **판단**: 이미 Kafka가 있으므로 Kafka Connect가 자연스러움. Source(Debezium) + Sink(ES) 커넥터를 하나의 Connect 클러스터에서 관리. REST API로 커넥터 상태 모니터링 가능.
 
 ---
 
-### 기능 3: 검색 API (moalog-server 수정)
-
-**기존 API 수정**:
-
-```
-기존: GET /api/v1/retrospects/search?keyword=회고
-      → MySQL LIKE 검색
-
-변경: GET /api/v1/retrospects/search?q=회고&method=KPT&from=2026-01-01&sort=relevance
-      → Elasticsearch 검색 (fallback: MySQL LIKE)
-```
-
-**새 쿼리 파라미터**:
-
-| 파라미터 | 타입 | 설명 |
-|---------|------|------|
-| `q` | string | 검색어 (title + responses + comments) |
-| `method` | enum | 회고 방법 필터 (KPT, 4L, 5F, PMI, FREE) |
-| `room_id` | i64 | 방 필터 |
-| `from` / `to` | date | 날짜 범위 |
-| `sort` | enum | relevance (기본) / date / likes |
-| `page` / `size` | int | 페이지네이션 |
-
-**Elasticsearch 쿼리**:
-
-```json
-{
-  "query": {
-    "bool": {
-      "must": [
-        {
-          "multi_match": {
-            "query": "회고",
-            "fields": ["title^3", "responses.content", "comments.text"],
-            "type": "best_fields",
-            "analyzer": "korean"
-          }
-        }
-      ],
-      "filter": [
-        { "terms": { "room_id": [1, 2, 3] } },
-        { "range": { "start_time": { "gte": "2026-01-01" } } }
-      ]
-    }
-  },
-  "highlight": {
-    "fields": {
-      "title": {},
-      "responses.content": { "fragment_size": 150 }
-    },
-    "pre_tags": ["<mark>"],
-    "post_tags": ["</mark>"]
-  },
-  "from": 0,
-  "size": 20
-}
-```
-
-**새 엔드포인트 (자동완성)**:
-
-```
-GET /api/v1/retrospects/suggest?q=프로
-
-→ Response:
-{
-  "suggestions": ["프로젝트 회고", "프로덕트 리뷰", "프로세스 개선"]
-}
-```
-
-**Elasticsearch Suggest 쿼리**:
-```json
-{
-  "suggest": {
-    "title-suggest": {
-      "prefix": "프로",
-      "completion": {
-        "field": "title.autocomplete",
-        "size": 5,
-        "skip_duplicates": true
-      }
-    }
-  }
-}
-```
-
-**변경 파일**:
-- `moalog-server/codes/server/Cargo.toml` — `elasticsearch` 크레이트 추가
-- `moalog-server/codes/server/src/config/elasticsearch.rs` (신규 — ES 클라이언트)
-- `moalog-server/codes/server/src/domain/retrospect/search_service.rs` (신규 — 검색 로직)
-- `moalog-server/codes/server/src/domain/retrospect/handler.rs` — search 핸들러 수정
-- `moalog-server/codes/server/src/domain/retrospect/dto.rs` — SearchQueryParams 확장
-- `moalog-server/codes/server/src/main.rs` — suggest 라우트 추가
-
-**Fallback 전략**:
-```rust
-async fn search(params: SearchParams) -> Result<Vec<SearchResult>> {
-    // 1차: Elasticsearch 검색 시도
-    match es_client.search(&params).await {
-        Ok(results) => Ok(results),
-        Err(e) => {
-            // ES 장애 시 MySQL LIKE 폴백
-            warn!("ES search failed, falling back to MySQL: {}", e);
-            mysql_like_search(&params).await
-        }
-    }
-}
-```
-
-> **트레이드오프**: ES 장애 시 MySQL LIKE로 폴백하면 검색 품질은 떨어지지만 서비스는 유지. Fail Open과 동일한 철학.
-
----
-
-### 기능 4: 초기 데이터 마이그레이션
-
-ES가 처음 시작될 때 기존 MySQL 데이터를 Elasticsearch에 벌크 색인:
-
-```bash
-# 초기 색인 스크립트
-#!/bin/bash
-# 1. ES 인덱스 생성 (매핑 적용)
-curl -X PUT "localhost:9200/moalog-retrospects" -H 'Content-Type: application/json' -d @index-mapping.json
-
-# 2. Debezium snapshot 모드로 초기 로드
-# Debezium의 snapshot.mode=initial이 자동으로 기존 데이터를 읽어서 Kafka → ES로 전달
-
-# 3. 이후부터는 binlog 기반 실시간 동기화
-```
-
-Debezium의 `snapshot.mode=initial` 설정이 초기 전체 로드를 자동 처리.
-
----
-
-## Docker Compose 변경
+## Docker Compose 추가
 
 ```yaml
-# 신규 서비스 3개 추가
+ai-assistant:
+  build: ../nori-search-engine
+  ports:
+    - "8085:8000"
+  environment:
+    OPENAI_API_KEY: ${OPENAI_API_KEY}
+    DATABASE_URL: postgresql://fluxpay:fluxpay@fluxpay-postgres:5432/fluxpay
+    MOALOG_DB_URL: mysql://root:moalog_local@mysql:3306/retrospect
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+  depends_on: [fluxpay-postgres, mysql, redis]
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
-    container_name: moalog-elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports:
-      - "${ES_PORT:-9200}:9200"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-
-  kafka-connect:
-    image: confluentinc/cp-kafka-connect:7.5.0
-    container_name: moalog-kafka-connect
-    depends_on:
-      fluxpay-kafka:
-        condition: service_started
-      elasticsearch:
-        condition: service_healthy
-    environment:
-      CONNECT_BOOTSTRAP_SERVERS: fluxpay-kafka:9092
-      CONNECT_GROUP_ID: moalog-connect
-      CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
-      CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
-      CONNECT_STATUS_STORAGE_TOPIC: connect-status
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_REST_PORT: 8083
-      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
-    ports:
-      - "${KAFKA_CONNECT_PORT:-8083}:8083"
-    command:
-      - bash
-      - -c
-      - |
-        confluent-hub install --no-prompt debezium/debezium-connector-mysql:2.5.0
-        confluent-hub install --no-prompt confluentinc/kafka-connect-elasticsearch:14.0.0
-        /etc/confluent/docker/run
-
-  # Kibana (선택 — ES 관리/디버깅용)
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.12.0
-    container_name: moalog-kibana
-    environment:
-      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
-    ports:
-      - "${KIBANA_PORT:-5601}:5601"
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-```
-
-**새 포트**:
-- Elasticsearch: 9200
-- Kafka Connect REST API: 8083
-- Kibana: 5601 (선택)
-
----
-
-## Prometheus 모니터링
-
-**ES 메트릭**: Elasticsearch Exporter 추가
-
-```yaml
-  elasticsearch-exporter:
-    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
-    container_name: moalog-es-exporter
-    command: ["--es.uri=http://elasticsearch:9200"]
-    ports:
-      - "9114:9114"
-```
-
-**Prometheus 타겟 추가**:
-```yaml
-- job_name: 'elasticsearch'
-  static_configs:
-    - targets: ['elasticsearch-exporter:9114']
-```
-
-**주요 메트릭**:
-- `elasticsearch_cluster_health_status`
-- `elasticsearch_indices_docs_count`
-- `elasticsearch_indices_search_query_time_seconds`
-- `elasticsearch_indices_indexing_index_time_seconds`
-
----
-
-## 검증 방법
-
-```bash
-# 1. ES 클러스터 헬스
-curl http://localhost:9200/_cluster/health?pretty
-
-# 2. 인덱스 매핑 확인
-curl http://localhost:9200/moalog-retrospects/_mapping?pretty
-
-# 3. Nori 분석기 테스트
-curl -X POST "localhost:9200/moalog-retrospects/_analyze" \
-  -H 'Content-Type: application/json' \
-  -d '{"analyzer": "korean", "text": "팀 프로젝트 회고를 진행했습니다"}'
-# → ["팀", "프로젝트", "회고", "진행"]
-
-# 4. 검색 테스트
-curl "localhost:8090/api/v1/retrospects/search?q=회고&sort=relevance"
-
-# 5. CDC 동기화 확인
-# MySQL에 INSERT → ES 인덱스에 자동 반영 확인 (지연 <2초)
-
-# 6. Kafka Connect 커넥터 상태
-curl http://localhost:8083/connectors/moalog-mysql-source/status
-curl http://localhost:8083/connectors/moalog-es-sink/status
+# PostgreSQL 이미지 변경: postgres:16-alpine → pgvector/pgvector:pg16
 ```
 
 ---
 
-## K8s 매니페스트 추가
+## moalog 통합
 
 ```
-k8s/base/
-├── elasticsearch/
-│   ├── statefulset.yaml     # ES 단일 노드
-│   ├── service.yaml
-│   └── kustomization.yaml
-├── kafka-connect/
-│   ├── deployment.yaml      # Debezium + ES Sink
-│   ├── service.yaml
-│   ├── configmap.yaml       # 커넥터 설정
-│   └── kustomization.yaml
-└── monitoring/exporters/
-    └── elasticsearch-exporter/
+1. 프론트엔드에 "AI 어시스턴트" 탭 추가
+   → POST /api/v1/assistant/chat → SSE 스트리밍 렌더링
+
+2. 회고 제출 시 자동 벡터화
+   → webhook 또는 sync job이 새 회고 감지 → 임베딩
+
+3. 기존 단건 분석과 공존
+   → 단건: moalog-server 기존 OpenAI 호출 (유지)
+   → 종합: 이 서비스의 RAG 기반 답변 (신규)
 ```
-
----
-
-## 예상 작업량
-
-| 기능 | 신규 파일 | 수정 파일 | 난이도 |
-|------|----------|----------|--------|
-| ES + Nori 인덱스 | 2 (매핑, 설정) | 0 | ★★☆ |
-| Debezium CDC | 3 (커넥터 설정) | 1 (docker-compose) | ★★★ |
-| 검색 API 수정 | 3 (ES 클라이언트, 검색 서비스, suggest) | 3 (handler, dto, routes) | ★★★ |
-| Docker/K8s 인프라 | 6 (compose, k8s manifests) | 2 (prometheus, makefile) | ★★☆ |
-
-**의존성**: ES 인프라 → CDC 파이프라인 → 검색 API (순차)
 
 ---
 
 ## 면접 키워드
 
-- Elasticsearch: 역인덱스, 형태소 분석, TF-IDF/BM25 스코어링
-- Nori: 한국어 형태소 분석, 품사 태깅, 스톱태그
-- CDC: Change Data Capture, binlog, Debezium, offset 관리
-- Kafka Connect: Source/Sink 패턴, SMT(Single Message Transform)
-- 검색 품질: relevance, boosting, multi_match, highlight
-- 동기화 전략: CDC vs Dual Write vs Application-Level Sync
-- Fallback: ES 장애 시 MySQL 폴백
+- RAG: Retrieval Augmented Generation, 환각 감소, 근거 기반 답변
+- Embedding: text-embedding-3-small, 코사인 유사도, 차원수 선택
+- pgvector: HNSW 인덱스, IVFFlat vs HNSW, SQL+벡터 결합
+- LangGraph: 상태 기반 워크플로우, 조건부 분기
+- 하이브리드 검색: RRF, 벡터+키워드 결합
+- 청킹 전략: 문서 크기, 메타데이터 보존
+- 토큰 관리: 컨텍스트 윈도우 최적화, 비용 제어
+- 스트리밍: SSE, 토큰 단위 전달
